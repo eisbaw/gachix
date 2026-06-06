@@ -1,6 +1,5 @@
+use super::PACKAGE_REF_PREFIX;
 use super::SINGLE_FILE_PACKAGE_MARKER;
-use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::fs;
 use std::str::FromStr;
 
@@ -22,6 +21,29 @@ use git2::Oid;
 use tracing::{debug, info, warn};
 
 use anyhow::Result;
+
+/// A valid 32-char Nix base32 store hash (alphabet `[0-9a-z]`).
+///
+/// HTTP handlers pass the raw URL component straight to the readers below; this is the
+/// trust-boundary check that prevents a crafted hash (e.g. containing `/` or `..`) from
+/// being interpolated into a ref path. `NixPath::new` enforces length but not charset.
+fn valid_hash(h: &str) -> bool {
+    h.len() == 32 && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Shard = first 2 chars of the 32-char base32 hash (1024 buckets). base32 is single-byte
+/// ASCII, so `[..2]` never splits a char.
+fn shard(hash: &str) -> &str {
+    debug_assert_eq!(hash.len(), 32);
+    &hash[..2]
+}
+
+/// The package branch ref: `refs/heads/gachix/<shard>/<hash>`. One ref per package; the
+/// commit it points at carries the contents (tree), the dependency closure (parents), and
+/// the signed narinfo (commit message).
+fn get_package_ref(hash: &str) -> String {
+    format!("{PACKAGE_REF_PREFIX}/{}/{}", shard(hash), hash)
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -101,7 +123,9 @@ impl Store {
 
         for url in &self.settings.remotes {
             let url_str = url.as_str();
-            let host = url.host().unwrap();
+            // host() is None for hostless peers (e.g. file:// local peers); fall back to
+            // the full URL for logging rather than panicking.
+            let host = url.host_str().unwrap_or(url_str);
             match self.repo.check_remote_health(&url_str) {
                 Ok(_) => info!("Succesfully connected to Git repository at {}", host),
                 Err(e) => {
@@ -114,18 +138,19 @@ impl Store {
         success
     }
 
+    /// Add a single package without materializing its dependency closure. Produces a
+    /// parentless commit (tree = contents, message = signed narinfo) under one branch ref —
+    /// self-consistent and servable; its references are intentionally not fetched/committed.
     pub async fn add_single(&self, package_path: &NixPath) -> Result<()> {
         info!("Adding single package {}", package_path.get_name());
         let package_id = package_path.get_base_32_hash();
 
-        let narinfo_ref = self.get_narinfo_ref(package_id);
-
-        if self.repo.reference_exists(&narinfo_ref)? {
+        if self.repo.reference_exists(&get_package_ref(package_id))? {
             debug!("Package already exists");
             return Ok(());
         }
 
-        let Ok(Some((_, narinfo_blob_oid, _))) =
+        let Ok(Some((narinfo, package_oid))) =
             self.get_package_from_nix_daemons(package_path).await
         else {
             bail!(
@@ -133,7 +158,10 @@ impl Store {
                 package_path
             );
         };
-        self.repo.add_ref(&narinfo_ref, narinfo_blob_oid)?;
+
+        let message = narinfo.to_string();
+        let commit_oid = self.repo.commit(package_oid, &[], Some(&message))?;
+        self.repo.add_ref(&get_package_ref(package_id), commit_oid)?;
         Ok(())
     }
 
@@ -158,51 +186,48 @@ impl Store {
     pub async fn _add_closure(&self, package_path: &NixPath) -> Result<Option<Oid>> {
         let package_id = package_path.get_base_32_hash();
 
-        // Check if commit already exists locally
+        // Check if the package commit already exists locally
         if let Some(commit_oid) = self.get_commit(package_id) {
             debug!("Package already exists: {}", package_path.get_name());
             return Ok(Some(commit_oid));
         }
 
-        // Ask Git peers if they have replicated the package
+        // Ask Git peers if they have replicated the package (and its closure)
         if let Some(commit_oid) = self.get_package_commit_from_git_remotes(package_path)? {
             return Ok(Some(commit_oid));
         }
 
-        // Ask known Nix daemons if they can build the package
-        let Ok(Some((narinfo, narinfo_blob_oid, package_oid))) =
+        // Ask known Nix daemons if they can provide the package
+        let Ok(Some((narinfo, package_oid))) =
             self.get_package_from_nix_daemons(package_path).await
         else {
             return Ok(None);
         };
 
-        // Recurse into package dependecies and collect their commit oids
+        // Recurse into package dependencies and collect their commit oids
         let deps = narinfo.get_dependencies();
         let mut parent_commits = Vec::new();
         for dependency in &deps {
-            let Some(dep_coid) = self._add_closure(&dependency).await? else {
+            let Some(dep_coid) = self._add_closure(dependency).await? else {
                 return Ok(None);
             };
             parent_commits.push(dep_coid);
         }
 
-        // Commit the package tree and specify dependency commits as parents
-        let commit_oid =
-            self.repo
-                .commit(package_oid, &parent_commits, Some(package_path.get_name()))?;
-
-        // Add references: nix-hash -> package-commit-oid, nix-hash -> narinfo-blob-oid
-        self.repo
-            .add_ref(&self.get_result_ref(package_id), commit_oid)?;
-        self.repo
-            .add_ref(&self.get_narinfo_ref(package_id), narinfo_blob_oid)?;
+        // ONE commit per package: tree = contents, parents = dependency commits,
+        // message = the signed narinfo. ONE ref => atomic publish.
+        let message = narinfo.to_string();
+        let commit_oid = self
+            .repo
+            .commit(package_oid, &parent_commits, Some(&message))?;
+        self.repo.add_ref(&get_package_ref(package_id), commit_oid)?;
         Ok(Some(commit_oid))
     }
 
     pub async fn get_package_from_nix_daemons(
         &self,
         package_path: &NixPath,
-    ) -> Result<Option<(NarInfo, Oid, Oid)>> {
+    ) -> Result<Option<(NarInfo, Oid)>> {
         for mut daemon in self.available_daemons()? {
             daemon.connect().await?;
             // Ask if daemon has the package
@@ -226,11 +251,11 @@ impl Store {
                 )?;
             }
 
-            // Get metadata info about the package and add it to the Git database
+            // Build narinfo metadata (signed). It is stored in the commit message, not as a
+            // separate blob, so there is nothing extra to write to the object database here.
             let narinfo = self
                 .build_narinfo(&mut daemon, package_oid.to_string().as_str(), package_path)
                 .await?;
-            let narinfo_blob_oid = self.repo.add_file_content(narinfo.to_string().as_bytes())?;
 
             match &daemon {
                 DynNixDaemon::Local(_) => {
@@ -243,82 +268,66 @@ impl Store {
                 ),
             }
             daemon.disconnect();
-            return Ok(Some((narinfo, narinfo_blob_oid, package_oid)));
+            return Ok(Some((narinfo, package_oid)));
         }
         Ok(None)
     }
 
+    /// Replicate a package and its whole closure from a Git peer.
+    ///
+    /// Fetching the single top branch transfers every reachable object (all dependency
+    /// commits, trees, blobs) via the commit DAG. We then materialize a local branch ref
+    /// for each closure member so every package is independently servable by hash.
     fn get_package_commit_from_git_remotes(&self, store_path: &NixPath) -> Result<Option<Oid>> {
         let package_id = store_path.get_base_32_hash();
-        let mut commit_oid = None;
-        let mut success_remote = "";
+        let top_ref = get_package_ref(package_id);
+
         for remote_url in &self.settings.remotes {
-            let url = remote_url.as_str();
-            if let Some(oid) = self.fetch_from_remote(package_id, url)? {
-                debug!(
-                    "Using git peer at {}, fetched package {}",
-                    remote_url,
-                    store_path.get_name()
-                );
-                commit_oid = Some(oid);
-                success_remote = url;
-                break;
-            }
-        }
-        if commit_oid == None {
-            return Ok(None);
-        }
-
-        let mut open = VecDeque::new();
-        let mut visited = HashSet::new();
-        open.push_back(package_id.to_string());
-        visited.insert(package_id.to_string());
-        while let Some(id) = open.pop_front() {
-            for dep in self.get_dep_ids(&id)? {
-                let dep_hash = dep.get_base_32_hash();
-                if !visited.contains(dep_hash) {
-                    if !(self.repo.reference_exists(&self.get_result_ref(dep_hash))?
-                        && self
-                            .repo
-                            .reference_exists(&self.get_narinfo_ref(dep_hash))?)
-                    {
-                        self.fetch_from_remote(dep_hash, success_remote)?;
-                        debug!(
-                            "Using git peer at {}, fetched package {}",
-                            success_remote,
-                            dep.get_name()
-                        );
-                    }
-                    // TODO: do I need to add to open queue if references already exist?
-                    open.push_back(dep_hash.to_string());
-                    visited.insert(dep_hash.to_string());
-                }
-            }
-        }
-
-        Ok(commit_oid)
-    }
-
-    fn fetch_from_remote(&self, package_id: &str, remote: &str) -> Result<Option<Oid>> {
-        if let Some(()) = self
-            .repo
-            .fetch(&remote, &format!("{}/*", self.get_package_ref(package_id)))?
-        {
-            let oid = self
-                .get_commit(package_id)
-                .ok_or_else(|| anyhow!("Could not get commit id for {}", package_id))?;
-            return Ok(Some(oid));
+            // fetch_ref pulls the whole closure into the ODB via a scratch ref and returns
+            // the tip OID (or None if this remote does not have the package). It does NOT
+            // create the canonical package ref — materialize_closure_refs does, only after
+            // the whole closure validates, so a partial/corrupt fetch never short-circuits
+            // a later re-fetch (transactional replication).
+            let Some(top_oid) = self.repo.fetch_ref(remote_url.as_str(), &top_ref)? else {
+                continue;
+            };
+            debug!(
+                "Using git peer at {}, fetched closure of {}",
+                remote_url,
+                store_path.get_name()
+            );
+            self.materialize_closure_refs(top_oid)?;
+            return Ok(Some(top_oid));
         }
         Ok(None)
     }
 
-    fn get_dep_ids(&self, package_id: &str) -> Result<Vec<NixPath>> {
-        let narinfo_blob = self
-            .get_narinfo(package_id)?
-            .ok_or_else(|| anyhow!("Could not find narinfo for {}", package_id))?;
-        let narinfo = NarInfo::parse(&String::from_utf8_lossy(&narinfo_blob).to_string())?;
-        let dependencies = narinfo.get_dependencies();
-        Ok(dependencies.into_iter().cloned().collect())
+    /// Create `refs/heads/gachix/<shard>/<hash>` for every package in the closure reachable
+    /// from `tip`, recovering each hash from the commit's narinfo (`StorePath:`). Objects are
+    /// already present from the single closure fetch.
+    ///
+    /// Transactional in two phases: (1) parse EVERY commit's narinfo first — any failure
+    /// (corruption / mixed-layout) aborts before a single canonical ref is written, so no
+    /// half-closure is left behind; (2) write the refs deps-first, the TOP ref LAST, so even
+    /// a ref-write failure cannot leave the top ref present (which would make a later
+    /// `_add_closure` short-circuit and never retry).
+    fn materialize_closure_refs(&self, tip: Oid) -> Result<()> {
+        // walk_commits yields the tip first, then its ancestors.
+        let mut to_create = Vec::new();
+        for commit_oid in self.repo.walk_commits(tip)? {
+            let msg = self.repo.get_commit_message_raw(commit_oid)?;
+            let narinfo = NarInfo::parse(&String::from_utf8_lossy(&msg))?;
+            let hash = narinfo.store_path.get_base_32_hash().to_string();
+            to_create.push((hash, commit_oid));
+        }
+        // Reverse so dependencies are written before the top package commit.
+        for (hash, commit_oid) in to_create.into_iter().rev() {
+            let r = get_package_ref(&hash);
+            if !self.repo.reference_exists(&r)? {
+                self.repo.add_ref(&r, commit_oid)?;
+            }
+        }
+        Ok(())
     }
 
     async fn build_narinfo(
@@ -375,21 +384,25 @@ impl Store {
     }
 
     pub fn get_narinfo(&self, base32_hash: &str) -> Result<Option<Vec<u8>>> {
-        let result = self
-            .repo
-            .get_oid_from_reference(&self.get_narinfo_ref(base32_hash));
-        match result {
-            Some(oid) => Ok(Some(self.repo.get_blob(oid)?)),
+        if !valid_hash(base32_hash) {
+            return Ok(None);
+        }
+        match self.repo.get_oid_from_reference(&get_package_ref(base32_hash)) {
+            Some(commit_oid) => Ok(Some(self.repo.get_commit_message_raw(commit_oid)?)),
             None => Ok(None),
         }
     }
 
     pub fn entry_exists(&self, base32_hash: &str) -> Result<bool> {
-        self.repo
-            .reference_exists(&self.get_result_ref(base32_hash))
+        if !valid_hash(base32_hash) {
+            return Ok(false);
+        }
+        self.repo.reference_exists(&get_package_ref(base32_hash))
     }
 
     pub fn get_as_nar_stream(&self, key: &str) -> Result<Option<NarGitStream>> {
+        // `key` is a git tree/blob OID hex (from the narinfo URL), validated by Oid::from_str
+        // below — NOT a store hash, so valid_hash() does not apply here.
         let tree_oid = Oid::from_str(key)?;
         // get the blob oid if the package consists of a single file
         // else use the package tree oid
@@ -401,28 +414,18 @@ impl Store {
     }
 
     pub fn list_entries(&self) -> Result<Vec<String>> {
-        let entries = self.repo.list_references("refs/*")?;
-        Ok(entries)
+        self.repo.list_references("refs/heads/gachix/*/*")
     }
 
     fn num_available_packages(&self) -> Result<usize> {
-        Ok(self.repo.list_references("refs/*/narinfo")?.len())
+        Ok(self.repo.list_references("refs/heads/gachix/*/*")?.len())
     }
 
     pub fn get_commit(&self, hash: &str) -> Option<Oid> {
-        self.repo.get_oid_from_reference(&self.get_result_ref(hash))
-    }
-
-    fn get_package_ref(&self, hash: &str) -> String {
-        format!("refs/{hash}")
-    }
-
-    fn get_result_ref(&self, hash: &str) -> String {
-        format!("{}/result", self.get_package_ref(hash))
-    }
-
-    fn get_narinfo_ref(&self, hash: &str) -> String {
-        format!("{}/narinfo", self.get_package_ref(hash))
+        if !valid_hash(hash) {
+            return None;
+        }
+        self.repo.get_oid_from_reference(&get_package_ref(hash))
     }
 }
 

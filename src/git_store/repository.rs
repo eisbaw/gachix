@@ -13,46 +13,53 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
 use tracing::{Level, info, instrument, span, trace};
 
+/// A handle to the on-disk Git store.
+///
+/// Holds only the repository path; every operation opens its OWN single-owner
+/// `git2::Repository`. A libgit2 `Repository` is not safe to share across threads
+/// (its ODB has internal mutable caches), so the previous `Arc<RwLock<Repository>>`
+/// + `unsafe impl Sync` was unsound under concurrent serving. `PathBuf` is `Send + Sync`,
+/// so `GitRepo` is auto `Send + Sync` with no unsafe — which the NAR-decode closure in
+/// `daemon::fetch` (bounded `Send + Sync + 'static`) requires.
+#[derive(Clone)]
 pub struct GitRepo {
-    repo: Arc<RwLock<Repository>>,
+    path: PathBuf,
 }
-unsafe impl Sync for GitRepo {}
-unsafe impl Send for GitRepo {}
 
 impl GitRepo {
     pub fn new(path_to_repo: &Path) -> Result<Self, git2::Error> {
         let repo = if path_to_repo.exists() {
             info!(
                 "Using an existing Git repository at {}",
-                path_to_repo.to_str().unwrap()
+                path_to_repo.display()
             );
             Repository::open(path_to_repo)?
         } else {
             info!(
                 "Initializing a new Git repository at {}",
-                path_to_repo.to_str().unwrap()
+                path_to_repo.display()
             );
             Repository::init(path_to_repo)?
         };
         let mut config = repo.config()?;
         config.set_str("protocol.version", "2")?;
+        // Store the canonical gitdir so future opens are stable (bare: the repo dir).
         Ok(Self {
-            repo: RwLock::new(repo).into(),
+            path: repo.path().to_path_buf(),
         })
     }
 
-    pub fn add_file_content(&self, content: &[u8]) -> Result<Oid> {
-        let read_repo = self.repo.read().unwrap();
-        let blob_oid = read_repo.blob(content)?;
-        Ok(blob_oid)
+    /// Open a fresh, single-owner libgit2 handle against the on-disk repo.
+    /// Cheap for local repositories; gives each caller/stream an isolated handle.
+    fn open(&self) -> Result<Repository> {
+        Ok(Repository::open(&self.path)?)
     }
 
     pub fn add_single_entry_tree(&self, entry_oid: Oid, name: &str, filemode: i32) -> Result<Oid> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         let mut builder = repo.treebuilder(None)?;
         builder.insert(&name, entry_oid, filemode)?;
         Ok(builder.write()?)
@@ -69,7 +76,7 @@ impl GitRepo {
     }
 
     pub fn add_nar(&self, content: impl Read) -> Result<(Oid, i32)> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         let decoder = NarGitDecoder::new(&repo);
         let (oid, filemode) = decoder
             .parse(content)
@@ -77,43 +84,61 @@ impl GitRepo {
         Ok((oid, filemode))
     }
 
-    pub fn get_blob(&self, oid: Oid) -> Result<Vec<u8>> {
-        let repo = self.repo.read().unwrap();
-        let blob = repo.find_blob(oid)?;
-        Ok(blob.content().to_vec())
+    /// Raw commit message bytes — the stored narinfo, byte-for-byte.
+    /// MUST use `message_raw_bytes()`; `message()`/`message_bytes()` trim leading
+    /// whitespace/newlines and would corrupt the narinfo round-trip.
+    pub fn get_commit_message_raw(&self, oid: Oid) -> Result<Vec<u8>> {
+        let repo = self.open()?;
+        Ok(repo.find_commit(oid)?.message_raw_bytes().to_vec())
     }
 
+    /// All commit OIDs reachable from `tip` — the whole package closure, since a
+    /// package commit's parents are its dependency commits.
+    pub fn walk_commits(&self, tip: Oid) -> Result<Vec<Oid>> {
+        let repo = self.open()?;
+        let mut walk = repo.revwalk()?;
+        walk.push(tip)?;
+        let mut out = Vec::new();
+        for oid in walk {
+            out.push(oid?);
+        }
+        Ok(out)
+    }
+
+    /// Create/update a reference to `oid`. Force-updates: package commit OIDs are
+    /// deterministic (fixed signature/time), so a re-publish writes the identical OID
+    /// (no-op clobber); closure materialization and CI re-push need idempotency.
     pub fn add_ref(&self, ref_name: &str, oid: Oid) -> Result<()> {
-        let repo = self.repo.read().unwrap();
-        repo.reference(&ref_name, oid, false, "")?;
+        let repo = self.open()?;
+        repo.reference(ref_name, oid, /* force = */ true, "")?;
         Ok(())
     }
 
     pub fn get_entry_as_nar(&self, oid: Oid) -> Result<Option<NarGitStream>> {
-        let repo = self.repo.read().unwrap();
-        let object = repo.find_object(oid, None)?;
-        let kind = object
-            .kind()
-            .ok_or_else(|| anyhow!("Object with oid {} does not have a type", oid))?;
-        let filemode = match kind {
-            git2::ObjectType::Blob => FileMode::Blob.into(),
-            git2::ObjectType::Tree => FileMode::Tree.into(),
-            _ => bail!("Object must either be a tree or a blob"),
-        };
+        let repo = self.open()?;
+        let filemode = {
+            let object = repo.find_object(oid, None)?;
+            let kind = object
+                .kind()
+                .ok_or_else(|| anyhow!("Object with oid {} does not have a type", oid))?;
+            match kind {
+                git2::ObjectType::Blob => FileMode::Blob.into(),
+                git2::ObjectType::Tree => FileMode::Tree.into(),
+                _ => bail!("Object must either be a tree or a blob"),
+            }
+        }; // `object` borrow of `repo` ends here, before `repo` is moved into the stream
 
-        let repo_owned = Arc::clone(&self.repo);
-        let stream = NarGitStream::new(repo_owned, oid, filemode);
+        let stream = NarGitStream::new(repo, oid, filemode);
         Ok(Some(stream))
     }
 
     pub fn get_oid_from_reference(&self, reference: &str) -> Option<Oid> {
-        let repo = self.repo.read().unwrap();
-        let res = repo.find_reference(reference).ok().and_then(|r| r.target());
-        res
+        let repo = self.open().ok()?;
+        repo.find_reference(reference).ok().and_then(|r| r.target())
     }
 
     fn create_tree_from_dir(&self, path: &Path) -> Result<Oid> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         let mut builder = repo.treebuilder(None)?;
         for entry in path.read_dir()? {
             let entry_path = entry?.path();
@@ -149,7 +174,7 @@ impl GitRepo {
         let span = span!(Level::TRACE, "Commiting", comment);
         let _guard = span.enter();
 
-        let repo = self.repo.write().unwrap();
+        let repo = self.open()?;
         let sig = Signature::new("gachix", "gachix@gachix.com", &Time::new(0, 0))?;
 
         trace!("Retrieving main tree object {}", tree_oid);
@@ -177,7 +202,7 @@ impl GitRepo {
     }
 
     pub fn reference_exists(&self, name: &str) -> Result<bool> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         match repo.find_reference(name) {
             Ok(_) => Ok(true),
             Err(e) => {
@@ -191,7 +216,7 @@ impl GitRepo {
     }
 
     pub fn list_references(&self, ref_name: &str) -> Result<Vec<String>> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         let refs = repo.references_glob(ref_name)?;
         let mut refs_names = Vec::new();
         for reference in refs {
@@ -207,7 +232,7 @@ impl GitRepo {
     }
 
     pub fn match_sole_entry_id(&self, tree_oid: Oid, name: &str) -> Result<Option<Oid>> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         let tree = repo.find_tree(tree_oid)?;
         if tree.len() != 1 {
             return Ok(None);
@@ -226,7 +251,7 @@ impl GitRepo {
     }
 
     pub fn check_remote_health(&self, url: &str) -> Result<()> {
-        let repo = self.repo.read().unwrap();
+        let repo = self.open()?;
         let mut remote = repo.remote_anonymous(url)?;
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(|_url, _user_from_url, _allowed_types| {
@@ -252,22 +277,23 @@ impl GitRepo {
         }
     }
 
+    /// Fetch `remote_ref` from `url` into a scratch ref and return its resolved commit OID,
+    /// or `Ok(None)` if the remote does not advertise the ref.
+    ///
+    /// Fetches into a scratch namespace (NOT the canonical package ref) so the caller can
+    /// create canonical refs only after the whole closure is validated — replication stays
+    /// transactional even if the closure is corrupt or the process dies mid-way.
     #[instrument(skip(self))]
-    pub fn fetch(&self, url: &str, reference: &str) -> Result<Option<()>> {
-        let repo = self.repo.read().unwrap();
-        let mut remote = match repo.find_remote("peer") {
-            Ok(remote) => remote,
-            _ => repo.remote_with_fetch("peer", url, "")?,
-        };
-        let refspec = format!("{}:{}", reference, reference);
+    pub fn fetch_ref(&self, url: &str, remote_ref: &str) -> Result<Option<Oid>> {
+        let repo = self.open()?;
+        // Anonymous remote: a per-open handle must not reuse a stale persisted remote.
+        let mut remote = repo.remote_anonymous(url)?;
+        let scratch = "refs/gachix-fetch/scratch";
+        let refspec = format!("+{}:{}", remote_ref, scratch);
 
-        trace!("Fetching from remote");
+        trace!("Fetching {} from remote into scratch", remote_ref);
         let mut fetch_options = FetchOptions::new();
         let mut callbacks = RemoteCallbacks::new();
-        callbacks.update_tips(|r, _, _| {
-            trace!("Added reference {r}");
-            true
-        });
         callbacks.credentials(|_url, _user_from_url, _allowed_types| {
             let user = env::var("USER").unwrap();
             if _allowed_types.contains(git2::CredentialType::USERNAME) {
@@ -283,23 +309,30 @@ impl GitRepo {
         fetch_options.remote_callbacks(callbacks);
         fetch_options.download_tags(git2::AutotagOption::None);
         fetch_options.update_fetchhead(false);
-        remote.fetch(&vec![refspec], Some(&mut fetch_options), None)?;
 
-        if remote.stats().received_objects() == 0 {
-            trace!("Did not receive anything");
-            return Ok(None);
+        // Fetching a specific ref the remote does not advertise makes libgit2 fail with
+        // "couldn't find remote ref ...". libgit2 exposes no typed error for this, so we
+        // match narrowly (NotFound code, or the specific phrase) and treat it as "remote
+        // does not have the package" (Ok(None)); any other error is propagated (fail-fast).
+        if let Err(e) = remote.fetch(&[refspec], Some(&mut fetch_options), None) {
+            let msg = e.message().to_lowercase();
+            if e.code() == ErrorCode::NotFound || msg.contains("couldn't find remote ref") {
+                trace!("Remote does not have {} ({})", remote_ref, e.message());
+                return Ok(None);
+            }
+            return Err(e.into());
         }
-        trace!("Received {} objects", remote.stats().received_objects());
 
-        Ok(Some(()))
-    }
-}
-
-impl Clone for GitRepo {
-    fn clone(&self) -> Self {
-        Self {
-            repo: self.repo.clone(),
+        // Success is decided by whether the scratch ref now resolves — NOT by
+        // received_objects(), which is 0 when the closure's objects are already present
+        // locally (e.g. shared with a previously-fetched sibling closure).
+        let oid = repo.find_reference(scratch).ok().and_then(|r| r.target());
+        // Drop the scratch ref; the fetched objects stay in the ODB and are made reachable
+        // by the canonical refs the caller creates immediately after (no GC runs between).
+        if let Ok(mut r) = repo.find_reference(scratch) {
+            let _ = r.delete();
         }
+        Ok(oid)
     }
 }
 

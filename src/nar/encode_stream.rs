@@ -5,7 +5,6 @@ use futures::Stream;
 use git2::{FileMode, ObjectType, Oid, Repository};
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::vec::IntoIter;
 
@@ -47,13 +46,16 @@ enum TraversalState {
 }
 
 pub struct NarGitStream {
-    repo: Arc<RwLock<Repository>>,
+    // OWNED, single-owner libgit2 handle. `Repository` is Send but !Sync; this is sound
+    // because actix polls each response stream on a single worker thread and never shares
+    // or moves it concurrently. Do NOT wrap this in a multi-threaded executor or share it.
+    repo: Repository,
     stack: Vec<TraversalState>,
     pending_chunks: VecDeque<Result<Bytes>>,
 }
 
 impl NarGitStream {
-    pub fn new(repo: Arc<RwLock<Repository>>, root_obj: Oid, root_obj_filemode: i32) -> Self {
+    pub fn new(repo: Repository, root_obj: Oid, root_obj_filemode: i32) -> Self {
         let mut pending_chunks = VecDeque::new();
         pending_chunks.push_back(Ok(write_padded_bytes(NIX_VERSION_MAGIC)));
 
@@ -102,7 +104,7 @@ impl Stream for NarGitStream {
                     }
 
                     let (node_type_str, owned_data) = {
-                        let repo = self.repo.read().unwrap();
+                        let repo = &self.repo;
                         let Ok(obj) = repo.find_object(oid, Some(kind)) else {
                             let err = anyhow!("Could not find object with oid {}", oid);
                             return Poll::Ready(Some(Err(err)));
@@ -239,7 +241,6 @@ mod tests {
     use nix_nar::Encoder;
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
 
     #[test]
@@ -258,7 +259,6 @@ mod tests {
         let mut encoder = Encoder::new(&file_name)?;
         encoder.read_to_end(&mut expected_nar)?;
 
-        let repo = Arc::new(RwLock::new(repo));
         let nar_stream = NarGitStream::new(repo, oid, FileMode::Blob.into());
         let results: Vec<Result<Bytes>> = block_on(nar_stream.collect());
         let mut actual_nar = Vec::new();

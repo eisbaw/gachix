@@ -65,7 +65,12 @@ impl NarInfo {
             .lines()
             .enumerate()
             .map(|(line_num, line)| {
-                line.split_once(": ")
+                // Split on the first ':' (not ": ") so empty-value fields parse too. A field
+                // like `Sig:`/`References:` (empty value) loses its trailing space when the
+                // whole content is trimmed; `v.trim()` then yields "" correctly. Values that
+                // contain ':' (NarHash, Sig) are unaffected — only the first ':' is the
+                // key/value separator.
+                line.split_once(':')
                     .map(|(k, v)| Ok((k.trim(), v.trim())))
                     .unwrap_or_else(|| {
                         Err(anyhow::anyhow!(

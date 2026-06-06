@@ -1,0 +1,49 @@
+name: Publish gachix image to GHCR
+
+# Builds the fork's Nix dockerTools image and pushes it to ghcr.io/eisbaw/gachix.
+# The demo cache workflow pulls this image (the upstream ephraimsiegfried/gachix image
+# does not understand the sharded refs/heads/gachix/<shard>/<hash> layout).
+
+on:
+  push:
+    branches: [sharded-refs, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build streamed layered image and load it
+        run: |
+          # streamLayeredImage's output is a script that streams the image tar to stdout.
+          img="$(nix build --no-link --print-out-paths .#dockerImage)"
+          "$img" | docker load
+          echo "nixTag=$(nix eval --raw .#dockerImage.imageTag)" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push (latest + sha + nixTag)
+        run: |
+          for tag in latest "${GITHUB_SHA}" "${nixTag}"; do
+            docker tag "gachix:${nixTag}" "ghcr.io/eisbaw/gachix:${tag}"
+            docker push "ghcr.io/eisbaw/gachix:${tag}"
+          done
+          echo "Pushed ghcr.io/eisbaw/gachix:{latest,${GITHUB_SHA},${nixTag}}"
+          echo "NOTE: make the GHCR package 'gachix' PUBLIC once, so the demo repo can pull it without login."

@@ -38,6 +38,6 @@ base64 = "0.22.1"
 [dev-dependencies]
 nix-nar = "0.3.0"
 tempfile = "3.23.0"
-rand = { version = "0.8", features = ["alloc"] }
+rand = { version = "0.9", features = ["alloc"] }
 assert_cmd = "2.1.1"
 reqwest = { version = "0.12.24", features = ["blocking"] }
